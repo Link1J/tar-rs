@@ -684,7 +684,8 @@ impl Header {
     ///
     /// May return an error if the field is corrupted.
     pub fn cksum(&self) -> io::Result<u32> {
-        octal_from(&self.as_old().cksum)
+        let test = self.as_old().cksum;
+        octal_from(&test)
             .map(|u| u as u32)
             .map_err(|err| {
                 io::Error::new(

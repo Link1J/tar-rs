@@ -1,11 +1,16 @@
 use std::borrow::Cow;
 use std::cmp;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::prelude::*;
-use std::io::{self, Error, ErrorKind, SeekFrom};
+use std::io::{Error, ErrorKind, SeekFrom};
 use std::marker;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::fs::OpenOptions;
+use tokio::io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeekExt};
+
+use futures::TryFutureExt;
 
 use filetime::{self, FileTime};
 
@@ -20,13 +25,16 @@ use crate::{Archive, Header, PaxExtensions};
 /// This structure is a window into a portion of a borrowed archive which can
 /// be inspected. It acts as a file handle by implementing the Reader trait. An
 /// entry cannot be rewritten once inserted into an archive.
-pub struct Entry<'a, R: 'a + Read> {
+#[derive(Debug)]
+pub struct Entry<'a, R: 'a + Read + Unpin> {
     fields: EntryFields<'a>,
     _ignored: marker::PhantomData<&'a Archive<R>>,
 }
 
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
+
+#[derive(Debug)]
 pub struct EntryFields<'a> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,
@@ -46,8 +54,17 @@ pub struct EntryFields<'a> {
 
 pub enum EntryIo<'a> {
     Pad(io::Take<io::Repeat>),
-    Data(io::Take<&'a ArchiveInner<dyn Read + 'a>>),
+    Data(io::Take<&'a ArchiveInner<dyn Read + Unpin + 'a>>),
 }
+impl<'a> std::fmt::Debug for EntryIo<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            EntryIo::Pad(f0) => f.debug_tuple("Pad").field(&f0).finish(),
+            EntryIo::Data(_f0) => f.debug_tuple("Data").finish(),
+        }
+    }
+}
+
 
 /// When unpacking items the unpacked thing is returned to allow custom
 /// additional handling by users. Today the File is returned, in future
@@ -55,13 +72,13 @@ pub enum EntryIo<'a> {
 #[derive(Debug)]
 pub enum Unpacked {
     /// A file was unpacked.
-    File(std::fs::File),
+    File(tokio::fs::File),
     /// A directory, hardlink, symlink, or other node was unpacked.
     #[doc(hidden)]
     __Nonexhaustive,
 }
 
-impl<'a, R: Read> Entry<'a, R> {
+impl<'a, R: Read + Unpin> Entry<'a, R> {
     /// Returns the path name for this entry.
     ///
     /// This method may fail if the pathname is not valid Unicode and this is
@@ -132,8 +149,8 @@ impl<'a, R: Read> Entry<'a, R> {
     ///
     /// Also note that this function will read the entire entry if the entry
     /// itself is a list of extensions.
-    pub fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions>> {
-        self.fields.pax_extensions()
+    pub async fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions>> {
+        self.fields.pax_extensions().await
     }
 
     /// Returns access to the header of this entry in the archive.
@@ -190,18 +207,21 @@ impl<'a, R: Read> Entry<'a, R> {
     /// # Examples
     ///
     /// ```no_run
-    /// use std::fs::File;
+    /// use tokio::fs::File;
+    /// use futures::StreamExt;
     /// use tar::Archive;
+    /// # async {
+    /// let mut ar = Archive::new(File::open("foo.tar").await.unwrap());
     ///
-    /// let mut ar = Archive::new(File::open("foo.tar").unwrap());
-    ///
-    /// for (i, file) in ar.entries().unwrap().enumerate() {
+    /// let mut entries = ar.entries().unwrap().enumerate();
+    /// while let Some((i, file)) = entries.next().await {
     ///     let mut file = file.unwrap();
-    ///     file.unpack(format!("file-{}", i)).unwrap();
+    ///     file.unpack(format!("file-{}", i)).await.unwrap();
     /// }
+    /// # };
     /// ```
-    pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
-        self.fields.unpack(None, dst.as_ref())
+    pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
+        self.fields.unpack(None, dst.as_ref()).await
     }
 
     /// Extracts this file under the specified path, avoiding security issues.
@@ -218,18 +238,21 @@ impl<'a, R: Read> Entry<'a, R> {
     /// # Examples
     ///
     /// ```no_run
-    /// use std::fs::File;
+    /// use tokio::fs::File;
+    /// use futures::StreamExt;
     /// use tar::Archive;
+    /// # async {
+    /// let mut ar = Archive::new(File::open("foo.tar").await.unwrap());
     ///
-    /// let mut ar = Archive::new(File::open("foo.tar").unwrap());
-    ///
-    /// for (i, file) in ar.entries().unwrap().enumerate() {
+    /// let mut entries = ar.entries().unwrap().enumerate();
+    /// while let Some((i, file)) = entries.next().await {
     ///     let mut file = file.unwrap();
-    ///     file.unpack_in("target").unwrap();
+    ///     file.unpack_in("target").await.unwrap();
     /// }
+    /// # };
     /// ```
-    pub fn unpack_in<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<bool> {
-        self.fields.unpack_in(dst.as_ref())
+    pub async fn unpack_in<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<bool> {
+        self.fields.unpack_in(dst.as_ref()).await
     }
 
     /// Set the mask of the permission bits when unpacking this entry.
@@ -275,29 +298,33 @@ impl<'a, R: Read> Entry<'a, R> {
     }
 }
 
-impl<'a, R: Read> Read for Entry<'a, R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        self.fields.read(into)
+impl<'a, R: Read + Unpin> Read for Entry<'a, R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.as_mut().fields).poll_read(cx, buf)
     }
 }
 
 impl<'a> EntryFields<'a> {
-    pub fn from<R: Read>(entry: Entry<R>) -> EntryFields {
+    pub fn from<R: Read + Unpin>(entry: Entry<R>) -> EntryFields {
         entry.fields
     }
 
-    pub fn into_entry<R: Read>(self) -> Entry<'a, R> {
+    pub fn into_entry<R: Read + Unpin>(self) -> Entry<'a, R> {
         Entry {
             fields: self,
             _ignored: marker::PhantomData,
         }
     }
 
-    pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
+    pub async fn read_all(&mut self) -> io::Result<Vec<u8>> {
         // Preallocate some data but don't let ourselves get too crazy now.
         let cap = cmp::min(self.size, 128 * 1024);
         let mut v = Vec::with_capacity(cap as usize);
-        self.read_to_end(&mut v).map(|_| v)
+        self.read_to_end(&mut v).await.map(|_| v)
     }
 
     fn path(&self) -> io::Result<Cow<Path>> {
@@ -364,21 +391,21 @@ impl<'a> EntryFields<'a> {
         }
     }
 
-    fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions>> {
+    async fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions>> {
         if self.pax_extensions.is_none() {
             if !self.header.entry_type().is_pax_global_extensions()
                 && !self.header.entry_type().is_pax_local_extensions()
             {
                 return Ok(None);
             }
-            self.pax_extensions = Some(self.read_all()?);
+            self.pax_extensions = Some(self.read_all().await?);
         }
         Ok(Some(PaxExtensions::new(
             self.pax_extensions.as_ref().unwrap(),
         )))
     }
 
-    fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
+    async fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
         // Notes regarding bsdtar 2.8.3 / libarchive 2.8.3:
         // * Leading '/'s are trimmed. For example, `///test` is treated as
         //   `test`.
@@ -436,6 +463,7 @@ impl<'a> EntryFields<'a> {
         let canon_target = self.validate_inside_dst(&dst, parent)?;
 
         self.unpack(Some(&canon_target), &file_dst)
+            .await
             .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
 
         Ok(true)
@@ -459,7 +487,7 @@ impl<'a> EntryFields<'a> {
     }
 
     /// Returns access to the header of this entry in the archive.
-    fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
+    async fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
         fn set_perms_ownerships(
             dst: &Path,
             f: Option<&mut std::fs::File>,
@@ -636,41 +664,48 @@ impl<'a> EntryFields<'a> {
 
         // Ensure we write a new file rather than overwriting in-place which
         // is attackable; if an existing file is found unlink it.
-        fn open(dst: &Path) -> io::Result<std::fs::File> {
-            OpenOptions::new().write(true).create_new(true).open(dst)
+        async fn open(dst: &Path) -> io::Result<tokio::fs::File> {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dst)
+                .await
         }
-        let mut f = (|| -> io::Result<std::fs::File> {
-            let mut f = open(dst).or_else(|err| {
-                if err.kind() != ErrorKind::AlreadyExists {
-                    Err(err)
-                } else if self.overwrite {
-                    match fs::remove_file(dst) {
-                        Ok(()) => open(dst),
-                        Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst),
-                        Err(e) => Err(e),
+        let f = async {
+            let mut f = open(dst)
+                .or_else(|err| async {
+                    if err.kind() != ErrorKind::AlreadyExists {
+                        Err(err)
+                    } else if self.overwrite {
+                        match fs::remove_file(dst) {
+                            Ok(()) => open(dst).await,
+                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst).await,
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Err(err)
                     }
-                } else {
-                    Err(err)
-                }
-            })?;
+                })
+                .await?;
             for io in self.data.drain(..) {
                 match io {
                     EntryIo::Data(mut d) => {
                         let expected = d.limit();
-                        if io::copy(&mut d, &mut f)? != expected {
+                        if io::copy(&mut d, &mut f).await? != expected {
                             return Err(other("failed to write entire file"));
                         }
                     }
                     EntryIo::Pad(d) => {
                         // TODO: checked cast to i64
                         let to = SeekFrom::Current(d.limit() as i64);
-                        let size = f.seek(to)?;
-                        f.set_len(size)?;
+                        let size = f.seek(to).await?;
+                        f.set_len(size).await?;
                     }
                 }
             }
             Ok(f)
-        })()
+        }
+        .await
         .map_err(|e| {
             let header = self.header.path_bytes();
             TarError::new(
@@ -683,6 +718,7 @@ impl<'a> EntryFields<'a> {
             )
         })?;
 
+        let mut f = f.into_std().await;
         if self.preserve_mtime {
             if let Some(mtime) = get_mtime(&self.header) {
                 filetime::set_file_handle_times(&f, Some(mtime), Some(mtime)).map_err(|e| {
@@ -699,8 +735,9 @@ impl<'a> EntryFields<'a> {
             self.preserve_ownerships,
         )?;
         if self.unpack_xattrs {
-            set_xattrs(self, dst)?;
+            set_xattrs(self, dst).await?;
         }
+        let f = tokio::fs::File::from_std(f);
         return Ok(Unpacked::File(f));
 
         fn set_ownerships(
@@ -852,11 +889,11 @@ impl<'a> EntryFields<'a> {
         }
 
         #[cfg(all(unix, feature = "xattr"))]
-        fn set_xattrs(me: &mut EntryFields, dst: &Path) -> io::Result<()> {
+        async fn set_xattrs(me: &mut EntryFields<'_>, dst: &Path) -> io::Result<()> {
             use std::ffi::OsStr;
             use std::os::unix::prelude::*;
 
-            let exts = match me.pax_extensions() {
+            let exts = match me.pax_extensions().await {
                 Ok(Some(e)) => e,
                 _ => return Ok(()),
             };
@@ -949,24 +986,49 @@ impl<'a> EntryFields<'a> {
 }
 
 impl<'a> Read for EntryFields<'a> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         loop {
-            match self.data.get_mut(0).map(|io| io.read(into)) {
-                Some(Ok(0)) => {
-                    self.data.remove(0);
+            if let Some(io) = self.data.get_mut(0) {
+                let start = buf.filled().len();
+                match Pin::new(io).poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) if start == buf.filled().len() => {
+                        self.data.remove(0);
+                        if self.data.is_empty() {
+                            return Poll::Ready(Ok(()));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Ok(())) => {
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
                 }
-                Some(r) => return r,
-                None => return Ok(0),
+            } else {
+                // Unable to pull another value from `data`, so we are done.
+                return Poll::Ready(Ok(()));
             }
         }
     }
 }
 
 impl<'a> Read for EntryIo<'a> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        match *self {
-            EntryIo::Pad(ref mut io) => io.read(into),
-            EntryIo::Data(ref mut io) => io.read(into),
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            EntryIo::Pad(ref mut io) => Pin::new(io).poll_read(cx, buf),
+            EntryIo::Data(ref mut io) => Pin::new(io).poll_read(cx, buf),
         }
     }
 }
