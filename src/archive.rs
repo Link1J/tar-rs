@@ -680,7 +680,6 @@ impl<'a, R: ?Sized + Read + Unpin> Read for &'a ArchiveInner<R> {
         let output = obj.poll_read(cx, buf);
         let end = buf.filled().len();
         let read = end - start;
-        println!("Read: {}, {}", read, self.pos.load(Ordering::SeqCst));
         self.pos.fetch_add(read as u64, Ordering::SeqCst);
         output
     }
